@@ -1182,8 +1182,14 @@ func assertPluginVerification(scheme signature.SigningScheme, t *testing.T) {
 		VerificationLevel:   verificationLevel,
 	}
 	outcome, err = v.Verify(context.Background(), mock.ImageDescriptor, pluginSigEnv, opts)
-	if err != nil || outcome.Error != nil {
-		t.Fatalf("revocation plugin should not be invoked when the trust policy skips the revocation check. error : %v", outcome.Error)
+	// The plugin must not be invoked since its only capability was skipped, but
+	// the signature still carries a critical extended attribute unknown to
+	// notation, so verification MUST fail closed instead of silently passing.
+	if err == nil || outcome.Error == nil || outcome.Error.Error() != "extended critical attribute \"SomeKey\" was not processed by the verification plugin \"plugin-name\" (all extended critical attributes must be processed by the verification plugin)" {
+		t.Fatalf("verification should fail closed when critical extended attributes cannot be processed. error : %v", outcome.Error)
+	}
+	if outcome.Error != nil && outcome.Error.Error() == "failed to verify with plugin plugin-name: revocation plugin should not be invoked when the trust policy skips revocation check" {
+		t.Fatalf("revocation plugin should not be invoked when the trust policy skips the revocation check")
 	}
 
 	// plugin unexpected response

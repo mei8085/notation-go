@@ -425,6 +425,15 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 		return err
 	}
 
+	// Collect the critical extended attributes that notation has no built-in
+	// handler for. Any of them MUST be processed by the verification plugin,
+	// otherwise signature verification MUST fail.
+	unprocessedCriticalAttrs, err := getUnprocessedCriticalExtendedAttributes(&outcome.EnvelopeContent.SignerInfo)
+	if err != nil {
+		// malformed (e.g. non-string critical key) critical attribute: fail closed
+		return err
+	}
+
 	var installedPlugin pluginframework.VerifyPlugin
 	if verificationPluginName != "" {
 		logger.Debugf("Finding verification plugin %q", verificationPluginName)
@@ -538,29 +547,39 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 	}
 
 	// perform extended verification using verification plugin if present
-	if installedPlugin != nil {
-		var capabilitiesToVerify []pluginframework.Capability
-		for _, pc := range pluginCapabilities {
-			// skip the revocation capability if the trust policy is configured
-			// to skip it
-			if outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation] == trustpolicy.ActionSkip && pc == pluginframework.CapabilityRevocationCheckVerifier {
-				logger.Debugf("Skipping the %v validation", pc)
-				continue
-			}
-			capabilitiesToVerify = append(capabilitiesToVerify, pc)
+	var capabilitiesToVerify []pluginframework.Capability
+	for _, pc := range pluginCapabilities {
+		// skip the revocation capability if the trust policy is configured
+		// to skip it
+		if outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation] == trustpolicy.ActionSkip && pc == pluginframework.CapabilityRevocationCheckVerifier {
+			logger.Debugf("Skipping the %v validation", pc)
+			continue
 		}
-
-		if len(capabilitiesToVerify) > 0 {
-			logger.Debugf("Executing verification plugin %q with capabilities %v", verificationPluginName, capabilitiesToVerify)
-			response, err := executePlugin(ctx, installedPlugin, capabilitiesToVerify, outcome.EnvelopeContent, trustedIdentities, pluginConfig)
-			if err != nil {
-				return fmt.Errorf("failed to verify with plugin %s: %w", verificationPluginName, err)
-			}
-
-			return processPluginResponse(capabilitiesToVerify, response, outcome)
-		}
+		capabilitiesToVerify = append(capabilitiesToVerify, pc)
 	}
-	return nil
+
+	var processedCriticalAttrs []interface{}
+	if installedPlugin != nil && len(capabilitiesToVerify) > 0 {
+		logger.Debugf("Executing verification plugin %q with capabilities %v", verificationPluginName, capabilitiesToVerify)
+		response, err := executePlugin(ctx, installedPlugin, capabilitiesToVerify, outcome.EnvelopeContent, trustedIdentities, pluginConfig, unprocessedCriticalAttrs)
+		if err != nil {
+			return fmt.Errorf("failed to verify with plugin %s: %w", verificationPluginName, err)
+		}
+		processedCriticalAttrs = response.ProcessedAttributes
+
+		if err := processPluginResponse(capabilitiesToVerify, response, outcome); err != nil {
+			return err
+		}
+	} else if installedPlugin != nil {
+		logger.Debugf("No verification capability remains to be verified by the verification plugin %q", verificationPluginName)
+	}
+
+	// Fail closed if any critical extended attribute was left unprocessed. This
+	// covers the case where the signature carries critical attributes unknown to
+	// notation but either no verification plugin is specified, the plugin has no
+	// capability left to verify, or the plugin failed to report the attribute in
+	// its processedAttributes response.
+	return verifyProcessedCriticalExtendedAttributes(unprocessedCriticalAttrs, processedCriticalAttrs, verificationPluginName)
 }
 
 func (v *verifier) verifyRevocation(ctx context.Context, outcome *notation.VerificationOutcome) *notation.ValidationResult {
@@ -620,13 +639,6 @@ func processPluginResponse(capabilitiesToVerify []pluginframework.Capability, re
 	verificationPluginName, err := getVerificationPlugin(&outcome.EnvelopeContent.SignerInfo)
 	if err != nil {
 		return err
-	}
-
-	// verify all extended critical attributes are processed by the plugin
-	for _, attr := range getNonPluginExtendedCriticalAttributes(&outcome.EnvelopeContent.SignerInfo) {
-		if !slices.ContainsAny(response.ProcessedAttributes, attr.Key) {
-			return fmt.Errorf("extended critical attribute %q was not processed by the verification plugin %q (all extended critical attributes must be processed by the verification plugin)", attr.Key, verificationPluginName)
-		}
 	}
 
 	for _, capability := range capabilitiesToVerify {
@@ -873,7 +885,7 @@ func revocationFinalResult(certResults []*revocationresult.CertRevocationResult,
 	return finalResult, problematicCertSubject
 }
 
-func executePlugin(ctx context.Context, installedPlugin pluginframework.VerifyPlugin, capabilitiesToVerify []pluginframework.Capability, envelopeContent *signature.EnvelopeContent, trustedIdentities []string, pluginConfig map[string]string) (*pluginframework.VerifySignatureResponse, error) {
+func executePlugin(ctx context.Context, installedPlugin pluginframework.VerifyPlugin, capabilitiesToVerify []pluginframework.Capability, envelopeContent *signature.EnvelopeContent, trustedIdentities []string, pluginConfig map[string]string, unprocessedCriticalAttrs []signature.Attribute) (*pluginframework.VerifySignatureResponse, error) {
 	logger := log.GetLogger(ctx)
 	// sanity check
 	if installedPlugin == nil {
@@ -884,9 +896,12 @@ func executePlugin(ctx context.Context, installedPlugin pluginframework.VerifyPl
 	var attributesToProcess []string
 	extendedAttributes := make(map[string]interface{})
 
-	for _, attr := range getNonPluginExtendedCriticalAttributes(signerInfo) {
-		extendedAttributes[attr.Key.(string)] = attr.Value
-		attributesToProcess = append(attributesToProcess, attr.Key.(string))
+	for _, attr := range unprocessedCriticalAttrs {
+		// getUnprocessedCriticalExtendedAttributes only returns attributes with
+		// a string key, so the assertion below is safe.
+		key := attr.Key.(string)
+		extendedAttributes[key] = attr.Value
+		attributesToProcess = append(attributesToProcess, key)
 	}
 	logger.Debugf("Added plugin attributes to be processed %v", attributesToProcess)
 

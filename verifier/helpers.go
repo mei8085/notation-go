@@ -39,7 +39,12 @@ const (
 	HeaderVerificationPluginMinVersion = "io.cncf.notary.verificationPluginMinVersion"
 )
 
-// VerificationPluginHeaders specifies headers of a verification plugin
+// VerificationPluginHeaders specifies headers of a verification plugin.
+//
+// Notation has a built-in handler for each of these extended attributes, so
+// they never need to be delegated to a verification plugin. Every other
+// extended attribute marked critical MUST be processed by a verification
+// plugin, otherwise signature verification MUST fail.
 var VerificationPluginHeaders = []string{
 	HeaderVerificationPlugin,
 	HeaderVerificationPluginMinVersion,
@@ -69,18 +74,70 @@ func isCriticalFailure(result *notation.ValidationResult) bool {
 	return result.Action == trustpolicy.ActionEnforce && result.Error != nil
 }
 
-func getNonPluginExtendedCriticalAttributes(signerInfo *signature.SignerInfo) []signature.Attribute {
-	var criticalExtendedAttrs []signature.Attribute
-	for _, attr := range signerInfo.SignedAttributes.ExtendedAttributes {
-		attrStrKey, ok := attr.Key.(string)
-		// filter the plugin extended attributes
-		if ok && !slices.Contains(VerificationPluginHeaders, attrStrKey) {
-			// TODO support other attribute types
-			// (COSE attribute keys can be numbers)
-			criticalExtendedAttrs = append(criticalExtendedAttrs, attr)
-		}
+// notationHandledExtendedAttributes returns the set of extended attribute keys
+// that notation itself knows how to process. Every other extended attribute
+// marked critical MUST be processed by a verification plugin.
+func notationHandledExtendedAttributes(signerInfo *signature.SignerInfo) map[string]bool {
+	handled := map[string]bool{HeaderVerificationPlugin: true}
+	// The minimum version attribute is only meaningful, and therefore only
+	// handled by notation, when the verification plugin attribute is present.
+	if _, err := signerInfo.ExtendedAttribute(HeaderVerificationPlugin); err == nil {
+		handled[HeaderVerificationPluginMinVersion] = true
 	}
-	return criticalExtendedAttrs
+	return handled
+}
+
+// getUnprocessedCriticalExtendedAttributes returns the extended attributes that
+// are marked critical but have no built-in handler in notation. Those
+// attributes MUST be processed by a verification plugin, otherwise signature
+// verification MUST fail.
+//
+// Extended attributes that are NOT marked critical are informational: they do
+// not influence signature verification, are not required to be processed and
+// are therefore not returned.
+//
+// A critical extended attribute whose key is not a string is malformed:
+// notation cannot name it in the plugin contract, so it can never be processed.
+// An error is returned in that case and signature verification MUST fail.
+func getUnprocessedCriticalExtendedAttributes(signerInfo *signature.SignerInfo) ([]signature.Attribute, error) {
+	handled := notationHandledExtendedAttributes(signerInfo)
+	var unprocessed []signature.Attribute
+	for _, attr := range signerInfo.SignedAttributes.ExtendedAttributes {
+		if !attr.Critical {
+			// informational attribute, ignore it
+			continue
+		}
+		key, ok := attr.Key.(string)
+		if !ok {
+			return nil, fmt.Errorf("extended critical attribute with key %v is malformed: unsupported key type %T, only string keys can be processed", attr.Key, attr.Key)
+		}
+		if handled[key] {
+			// notation has a built-in handler for this attribute
+			continue
+		}
+		unprocessed = append(unprocessed, attr)
+	}
+	return unprocessed, nil
+}
+
+// verifyProcessedCriticalExtendedAttributes verifies that every critical
+// extended attribute without a built-in handler was processed by a verification
+// plugin holding a capability. Verification MUST fail if any such attribute was
+// left unprocessed.
+func verifyProcessedCriticalExtendedAttributes(unprocessed []signature.Attribute, processedAttributes []interface{}, verificationPluginName string) error {
+	for _, attr := range unprocessed {
+		// getUnprocessedCriticalExtendedAttributes only returns attributes with
+		// a string key, so the assertion below is safe.
+		key := attr.Key.(string)
+		if slices.ContainsAny(processedAttributes, key) {
+			continue
+		}
+		if verificationPluginName == "" {
+			return fmt.Errorf("extended critical attribute %q was not processed: notation has no built-in handler for it and the signature does not specify a verification plugin to process it", key)
+		}
+		return fmt.Errorf("extended critical attribute %q was not processed by the verification plugin %q (all extended critical attributes must be processed by the verification plugin)", key, verificationPluginName)
+	}
+	return nil
 }
 
 // extractCriticalStringExtendedAttribute extracts a critical string Extended
