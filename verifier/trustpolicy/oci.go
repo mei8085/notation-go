@@ -16,7 +16,6 @@ package trustpolicy
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/notaryproject/notation-go/dir"
@@ -136,35 +135,54 @@ func (policyDoc *OCIDocument) Validate() error {
 }
 
 // GetApplicableTrustPolicy returns a pointer to the deep copied [OCITrustPolicy]
-// statement that applies to the given registry scope. If no applicable trust
-// policy is found, returns an error.
+// statement that applies to the given artifact reference. If no applicable
+// trust policy is found, returns an error.
+//
+// Registry scopes are normalized before matching, so selection is
+// case-insensitive for the registry host and repository, ignores trailing
+// slashes as well as the artifact's tag and digest, and distinguishes the
+// registry, namespace and repository levels. Wildcard levels (for example
+// "registry.example.com/team/*") are supported: the most specific matching
+// scope always wins, so a narrower statement (including a deny/strict one) can
+// never be overridden by a broader wildcard statement or the global "*"
+// wildcard.
 // see https://github.com/notaryproject/specifications/tree/9c81dc773508dedc5a81c02c8d805de04f65050b/specs/trust-store-trust-policy.md#selecting-a-trust-policy-based-on-artifact-uri
 func (policyDoc *OCIDocument) GetApplicableTrustPolicy(artifactReference string) (*OCITrustPolicy, error) {
-	artifactPath, err := getArtifactPathFromReference(artifactReference)
+	artifact, err := parseArtifactReference(artifactReference)
 	if err != nil {
 		return nil, err
 	}
 
-	var wildcardPolicy *OCITrustPolicy
 	var applicablePolicy *OCITrustPolicy
-	for _, policyStatement := range policyDoc.TrustPolicies {
-		if slices.Contains(policyStatement.RegistryScopes, trustpolicy.Wildcard) {
-			// we need to deep copy because we can't use the loop variable
-			// address. see https://stackoverflow.com/a/45967429
-			wildcardPolicy = (&policyStatement).clone()
-		} else if slices.Contains(policyStatement.RegistryScopes, artifactPath) {
-			applicablePolicy = (&policyStatement).clone()
+	applicableSpecificity := -1
+	for i := range policyDoc.TrustPolicies {
+		policyStatement := &policyDoc.TrustPolicies[i]
+		matchedSpecificity := -1
+		for _, rawScope := range policyStatement.RegistryScopes {
+			scope, err := parseRegistryScope(rawScope)
+			if err != nil {
+				// the document is expected to be validated before use; an
+				// invalid scope simply cannot match the artifact.
+				continue
+			}
+			if scope.matches(artifact) && scope.specificity() > matchedSpecificity {
+				matchedSpecificity = scope.specificity()
+			}
+		}
+		if matchedSpecificity < 0 {
+			continue
+		}
+		if matchedSpecificity > applicableSpecificity {
+			// a more specific match always takes precedence over a broader
+			// match, regardless of statement order in the document.
+			applicablePolicy = policyStatement.clone()
+			applicableSpecificity = matchedSpecificity
 		}
 	}
 	if applicablePolicy != nil {
-		// a policy with exact match for registry scope takes precedence over
-		// a wildcard (*) policy.
 		return applicablePolicy, nil
-	} else if wildcardPolicy != nil {
-		return wildcardPolicy, nil
-	} else {
-		return nil, fmt.Errorf("artifact %q has no applicable oci trust policy statement. Trust policy applicability for a given artifact is determined by registryScopes. To create a trust policy, see: %s", artifactReference, trustPolicyLink)
 	}
+	return nil, fmt.Errorf("artifact %q has no applicable oci trust policy statement. Trust policy applicability for a given artifact is determined by registryScopes. To create a trust policy, see: %s", artifactReference, trustPolicyLink)
 }
 
 // clone returns a pointer to the deep copied [OCITrustPolicy]
@@ -191,12 +209,13 @@ func validateRegistryScopes(policyDoc *OCIDocument) error {
 			return fmt.Errorf("oci trust policy statement %q uses wildcard registry scope '*', a wildcard scope cannot be used in conjunction with other scope values", statement.Name)
 		}
 		for _, scope := range statement.RegistryScopes {
-			if scope != trustpolicy.Wildcard {
-				if err := validateRegistryScopeFormat(scope); err != nil {
-					return err
-				}
+			normalized, err := parseRegistryScope(scope)
+			if err != nil {
+				return err
 			}
-			registryScopeCount[scope]++
+			// normalize equivalent scopes (e.g. differing only by case) so
+			// duplicates are detected regardless of how they are written.
+			registryScopeCount[normalizedRegistryScopeKey(normalized)]++
 		}
 	}
 
@@ -211,44 +230,15 @@ func validateRegistryScopes(policyDoc *OCIDocument) error {
 	return nil
 }
 
-func getArtifactPathFromReference(artifactReference string) (string, error) {
-	// TODO support more types of URI like "domain.com/repository",
-	// "domain.com/repository:tag"
-	i := strings.LastIndex(artifactReference, "@")
-	if i < 0 {
-		return "", fmt.Errorf("artifact URI %q could not be parsed, make sure it is the fully qualified oci artifact URI without the scheme/protocol. e.g domain.com:80/my/repository@sha256:digest", artifactReference)
+// normalizedRegistryScopeKey returns a canonical string representation of a
+// normalized registry scope, suitable for duplicate detection.
+func normalizedRegistryScopeKey(scope registryScope) string {
+	if scope.isGlobalWildcard() {
+		return trustpolicy.Wildcard
 	}
-	artifactPath := artifactReference[:i]
-	if err := validateRegistryScopeFormat(artifactPath); err != nil {
-		return "", err
+	key := scope.registry + "/" + strings.Join(scope.repository, "/")
+	if scope.wildcard {
+		key += "/*"
 	}
-	return artifactPath, nil
-}
-
-// validateRegistryScopeFormat validates if a scope is following the format
-// defined in distribution spec
-func validateRegistryScopeFormat(scope string) error {
-	// Domain and Repository regexes are adapted from distribution
-	// implementation
-	// https://github.com/distribution/distribution/blob/main/reference/regexp.go#L31
-	domainRegexp := regexp.MustCompile(`^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))+)?(?::[0-9]+)?$`)
-	repositoryRegexp := regexp.MustCompile(`^[a-z0-9]+(?:(?:(?:[._]|__|[-]*)[a-z0-9]+)+)?(?:(?:/[a-z0-9]+(?:(?:(?:[._]|__|[-]*)[a-z0-9]+)+)?)+)?$`)
-	ensureMessage := "make sure it is a fully qualified repository without the scheme, protocol or tag. For example domain.com/my/repository or a local scope like local/myOCILayout"
-	errorMessage := "registry scope %q is not valid, " + ensureMessage
-	errorWildCardMessage := "registry scope %q with wild card(s) is not valid, " + ensureMessage
-
-	// Check for presence of * in scope
-	if len(scope) > 1 && strings.Contains(scope, "*") {
-		return fmt.Errorf(errorWildCardMessage, scope)
-	}
-	domain, repository, found := strings.Cut(scope, "/")
-	if !found {
-		return fmt.Errorf(errorMessage, scope)
-	}
-	if domain == "" || repository == "" || !domainRegexp.MatchString(domain) || !repositoryRegexp.MatchString(repository) {
-		return fmt.Errorf(errorMessage, scope)
-	}
-
-	// No errors
-	return nil
+	return key
 }
