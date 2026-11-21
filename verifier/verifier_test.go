@@ -255,7 +255,7 @@ func assertNotationVerification(t *testing.T, scheme signature.SigningScheme) {
 	for _, level := range verificationLevels {
 		policyDocument := dummyOCIPolicyDocument()
 		policyDocument.TrustPolicies[0].TrustedIdentities = []string{"x509.subject:CN=LOL,O=DummyOrg,L=Hyderabad,ST=TG,C=IN"} // configure policy to not trust "CN=Notation Test Leaf Cert,O=Notary,L=Seattle,ST=WA,C=US" which is the subject of the signature's signing certificate
-		expectedErr := fmt.Errorf("signing certificate from the digital signature does not match the X.509 trusted identities [map[\"C\":\"IN\" \"CN\":\"LOL\" \"L\":\"Hyderabad\" \"O\":\"DummyOrg\" \"ST\":\"TG\"]] defined in the trust policy \"test-statement-name\"")
+		expectedErr := fmt.Errorf("signing certificate from the digital signature does not match the X.509 trusted identities [\"x509.subject:CN=LOL,O=DummyOrg,L=Hyderabad,ST=TG,C=IN\"] defined in the trust policy \"test-statement-name\"")
 		testCases = append(testCases, testCase{
 			signatureBlob:     validSigEnv,
 			verificationType:  trustpolicy.TypeAuthenticity,
@@ -1260,23 +1260,30 @@ func assertPluginVerification(scheme signature.SigningScheme, t *testing.T) {
 
 func TestVerifyX509TrustedIdentities(t *testing.T) {
 	certs, _ := corex509.ReadCertificateFile(filepath.FromSlash("testdata/verifier/signing-cert.pem"))        // cert's subject is "CN=SomeCN,OU=SomeOU,O=SomeOrg,L=Seattle,ST=WA,C=US"
-	unsupportedCerts, _ := corex509.ReadCertificateFile(filepath.FromSlash("testdata/verifier/bad-cert.pem")) // cert's subject is "CN=bad=#CN,OU=SomeOU,O=SomeOrg,L=Seattle,ST=WA,C=US"
+	escapedCharCerts, _ := corex509.ReadCertificateFile(filepath.FromSlash("testdata/verifier/bad-cert.pem")) // cert's subject is "CN=Bad=#CN,OU=SomeOU,O=SomeOrg,L=Seattle,ST=WA,C=US"
 
 	tests := []struct {
 		certs          []*x509.Certificate
 		x509Identities []string
 		wantErr        bool
+		wantIdentity   string
 	}{
-		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA"}, false},
-		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "nonX509Prefix:my-custom-identity"}, false},
-		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "x509.subject:C=IND,O=SomeOrg,ST=TS"}, false},
-		{certs, []string{"nonX509Prefix:my-custom-identity"}, true},
-		{certs, []string{"*"}, false},
-		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS"}, true},
-		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS", "nonX509Prefix:my-custom-identity"}, true},
-		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS", "x509.subject:C=LOL,O=LOL,ST=LOL"}, true},
-		{certs, []string{"x509.subject:C=bad=#identity,O=LOL,ST=LOL"}, true},
-		{unsupportedCerts, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "nonX509Prefix:my-custom-identity"}, true},
+		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA"}, false, "x509.subject:C=US,O=SomeOrg,ST=WA"},
+		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "nonX509Prefix:my-custom-identity"}, false, "x509.subject:C=US,O=SomeOrg,ST=WA"},
+		{certs, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "x509.subject:C=IND,O=SomeOrg,ST=TS"}, false, "x509.subject:C=US,O=SomeOrg,ST=WA"},
+		{certs, []string{"nonX509Prefix:my-custom-identity"}, true, ""},
+		{certs, []string{"*"}, false, "*"},
+		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS"}, true, ""},
+		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS", "nonX509Prefix:my-custom-identity"}, true, ""},
+		{certs, []string{"x509.subject:C=IND,O=SomeOrg,ST=TS", "x509.subject:C=LOL,O=LOL,ST=LOL"}, true, ""},
+		{certs, []string{"x509.subject:C=bad=#identity,O=LOL,ST=LOL"}, true, ""},
+		// a '#' character inside a certificate string value is valid per
+		// certificate semantics; it is not a hex-encoded BER value
+		{escapedCharCerts, []string{"x509.subject:C=US,O=SomeOrg,ST=WA", "nonX509Prefix:my-custom-identity"}, false, "x509.subject:C=US,O=SomeOrg,ST=WA"},
+		// case is normalized following X.501 caseIgnoreMatch semantics
+		{certs, []string{"x509.subject:C=us,O=someorg,ST=wa"}, false, "x509.subject:C=us,O=someorg,ST=wa"},
+		// RDN order in the trusted identity does not affect matching
+		{certs, []string{"x509.subject:ST=WA,O=SomeOrg,C=US"}, false, "x509.subject:ST=WA,O=SomeOrg,C=US"},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
@@ -1287,10 +1294,13 @@ func TestVerifyX509TrustedIdentities(t *testing.T) {
 				TrustStores:           []string{"ca:test-store"},
 				TrustedIdentities:     tt.x509Identities,
 			}
-			err := verifyX509TrustedIdentities(trustPolicy.Name, trustPolicy.TrustedIdentities, tt.certs)
+			matchedIdentity, err := verifyX509TrustedIdentities(trustPolicy.Name, trustPolicy.TrustedIdentities, tt.certs)
 
 			if tt.wantErr != (err != nil) {
 				t.Fatalf("TestVerifyX509TrustedIdentities Error: %q WantErr: %v", err, tt.wantErr)
+			}
+			if matchedIdentity != tt.wantIdentity {
+				t.Fatalf("TestVerifyX509TrustedIdentities matched identity: %q want: %q", matchedIdentity, tt.wantIdentity)
 			}
 		})
 	}

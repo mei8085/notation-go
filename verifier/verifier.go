@@ -494,7 +494,7 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 	// to perform this verification rather than a plugin)
 	if !slices.Contains(pluginCapabilities, pluginframework.CapabilityTrustedIdentityVerifier) {
 		logger.Debug("Validating trust identity")
-		err = verifyX509TrustedIdentities(policyName, trustedIdentities, outcome.EnvelopeContent.SignerInfo.CertificateChain)
+		matchedIdentity, err := verifyX509TrustedIdentities(policyName, trustedIdentities, outcome.EnvelopeContent.SignerInfo.CertificateChain)
 		if err != nil {
 			authenticityResult.Error = err
 			logVerificationResult(logger, authenticityResult)
@@ -502,6 +502,9 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 		if isCriticalFailure(authenticityResult) {
 			return authenticityResult.Error
 		}
+		// use the confirmed trusted identity that matched the verified
+		// certificate identity
+		logger.Debugf("Signing certificate identity matches the trusted identity %q", matchedIdentity)
 	}
 
 	// verify expiry
@@ -927,50 +930,64 @@ func executePlugin(ctx context.Context, installedPlugin pluginframework.VerifyPl
 	return installedPlugin.VerifySignature(ctx, req)
 }
 
-func verifyX509TrustedIdentities(policyName string, trustedIdentities []string, certs []*x509.Certificate) error {
+// verifyX509TrustedIdentities verifies the signing certificate's subject
+// against the x509.subject trusted identities configured in the trust
+// policy. On success, it returns the trusted identity that matched the
+// confirmed certificate identity, so that callers use the verified identity
+// rather than re-deriving one from unparsed certificate text.
+func verifyX509TrustedIdentities(policyName string, trustedIdentities []string, certs []*x509.Certificate) (string, error) {
 	if slices.Contains(trustedIdentities, trustpolicyInternal.Wildcard) {
-		return nil
+		return trustpolicyInternal.Wildcard, nil
 	}
 
-	var trustedX509Identities []map[string]string
+	type x509Identity struct {
+		raw string
+		dn  map[string]string
+	}
+	var trustedX509Identities []x509Identity
 	for _, identity := range trustedIdentities {
 		identityPrefix, identityValue, found := strings.Cut(identity, ":")
 		if !found {
-			return fmt.Errorf("trust policy statement %q has trusted identity %q missing separator", policyName, identity)
+			return "", fmt.Errorf("trust policy statement %q has trusted identity %q missing separator", policyName, identity)
 		}
 
 		// notation natively supports x509.subject identities only
 		if identityPrefix == trustpolicyInternal.X509Subject {
 			// identityValue cannot be empty
 			if identityValue == "" {
-				return fmt.Errorf("trust policy statement %q has trusted identity %q without an identity value", policyName, identity)
+				return "", fmt.Errorf("trust policy statement %q has trusted identity %q without an identity value", policyName, identity)
 			}
 			parsedSubject, err := pkix.ParseDistinguishedName(identityValue)
 			if err != nil {
-				return err
+				return "", err
 			}
-			trustedX509Identities = append(trustedX509Identities, parsedSubject)
+			trustedX509Identities = append(trustedX509Identities, x509Identity{raw: identity, dn: parsedSubject})
 		}
 	}
 
 	if len(trustedX509Identities) == 0 {
-		return fmt.Errorf("no x509 trusted identities are configured in the trust policy %q", policyName)
+		return "", fmt.Errorf("no x509 trusted identities are configured in the trust policy %q", policyName)
 	}
 
 	leafCert := certs[0] // trusted identities only supported on the leaf cert
 
-	// parse the certificate subject following rfc 4514 DN syntax
-	leafCertDN, err := pkix.ParseDistinguishedName(leafCert.Subject.String())
+	// parse the certificate subject following X.501 / RFC 5280 certificate
+	// semantics, preserving multi-valued RDNs and repeated attributes
+	leafCertDN, err := pkix.ParseCertDistinguishedName(leafCert)
 	if err != nil {
-		return fmt.Errorf("error while parsing the certificate subject from the digital signature. error : %q", err)
+		return "", fmt.Errorf("error while parsing the certificate subject from the digital signature. error : %q", err)
 	}
 	for _, trustedX509Identity := range trustedX509Identities {
-		if pkix.IsSubsetDN(trustedX509Identity, leafCertDN) {
-			return nil
+		if pkix.IsSubsetOfCertDN(trustedX509Identity.dn, leafCertDN) {
+			return trustedX509Identity.raw, nil
 		}
 	}
 
-	return fmt.Errorf("signing certificate from the digital signature does not match the X.509 trusted identities %q defined in the trust policy %q", trustedX509Identities, policyName)
+	rawIdentities := make([]string, 0, len(trustedX509Identities))
+	for _, trustedX509Identity := range trustedX509Identities {
+		rawIdentities = append(rawIdentities, trustedX509Identity.raw)
+	}
+	return "", fmt.Errorf("signing certificate from the digital signature does not match the X.509 trusted identities %q defined in the trust policy %q", rawIdentities, policyName)
 }
 
 func logVerificationResult(logger log.Logger, result *notation.ValidationResult) {
