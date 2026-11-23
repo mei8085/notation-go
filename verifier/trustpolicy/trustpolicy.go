@@ -55,7 +55,54 @@ const (
 	TypeAuthenticTimestamp ValidationType = "authenticTimestamp"
 	TypeExpiry             ValidationType = "expiry"
 	TypeRevocation         ValidationType = "revocation"
+
+	// TypeRevoked grades the revocation check for a confirmed revocation: at
+	// least one certificate in the chain was reported as revoked. It is only
+	// meaningful as a key of [SignatureVerification.Override] and refines the
+	// umbrella "revocation" action; it never enables or disables the
+	// revocation check by itself.
+	TypeRevoked ValidationType = "revoked"
+
+	// TypeRevocationUnavailable grades the revocation check for an
+	// undetermined revocation status: the status of at least one certificate
+	// could not be established (for example the OCSP responder or the CRL
+	// distribution point was unreachable, or the validator failed). It is
+	// only meaningful as a key of [SignatureVerification.Override] and
+	// refines the umbrella "revocation" action; it never enables or disables
+	// the revocation check by itself.
+	//
+	// The name follows the "revocation unavailable" wording of the Notary
+	// Project specification:
+	// https://github.com/notaryproject/specifications/blob/main/specs/trust-store-trust-policy.md#certificate-revocation-evaluation
+	TypeRevocationUnavailable ValidationType = "revocationUnavailable"
 )
+
+// RevocationOutcome classifies the result of a revocation check so that a
+// [VerificationLevel] can apply graded actions to the two failure classes.
+type RevocationOutcome string
+
+const (
+	// RevocationOutcomeRevoked means that the revocation check confirmed that
+	// at least one certificate in the chain is revoked. Its value matches
+	// [TypeRevoked], the override key that grades it.
+	RevocationOutcomeRevoked RevocationOutcome = RevocationOutcome(TypeRevoked)
+
+	// RevocationOutcomeUndetermined means that the revocation status of at
+	// least one certificate in the chain could not be determined. Its value
+	// matches [TypeRevocationUnavailable], the override key that grades it.
+	RevocationOutcomeUndetermined RevocationOutcome = RevocationOutcome(TypeRevocationUnavailable)
+)
+
+// RevocationOutcomes lists all graded revocation outcomes.
+var RevocationOutcomes = []RevocationOutcome{
+	RevocationOutcomeRevoked,
+	RevocationOutcomeUndetermined,
+}
+
+// String implements [fmt.Stringer].
+func (o RevocationOutcome) String() string {
+	return string(o)
+}
 
 const (
 	ActionEnforce ValidationAction = "enforce"
@@ -131,10 +178,27 @@ var (
 		TypeRevocation,
 	}
 
+	// RevocationGradedTypes lists the keys that refine the umbrella
+	// "revocation" action into graded actions for the two failure classes.
+	// They are accepted in [SignatureVerification.Override] only.
+	RevocationGradedTypes = []ValidationType{
+		TypeRevoked,
+		TypeRevocationUnavailable,
+	}
+
 	ValidationActions = []ValidationAction{
 		ActionEnforce,
 		ActionLog,
 		ActionSkip,
+	}
+
+	// RevocationGradedActions lists the actions accepted for
+	// [RevocationGradedTypes]. "skip" is not accepted: a graded action must
+	// still describe what happens to a revocation check that is performed.
+	// Use the umbrella "revocation" action to skip the check entirely.
+	RevocationGradedActions = []ValidationAction{
+		ActionEnforce,
+		ActionLog,
 	}
 
 	VerificationLevels = []*VerificationLevel{
@@ -202,8 +266,16 @@ func (signatureVerification *SignatureVerification) GetVerificationLevel() (*Ver
 				break
 			}
 		}
+		isGraded := false
+		for _, t := range RevocationGradedTypes {
+			if t == key {
+				validationType = t
+				isGraded = true
+				break
+			}
+		}
 		if validationType == "" {
-			return nil, fmt.Errorf("verification type %q in custom signature verification is not supported, supported values are %q", key, ValidationTypes)
+			return nil, fmt.Errorf("verification type %q in custom signature verification is not supported, supported values are %q and %q", key, ValidationTypes, RevocationGradedTypes)
 		}
 
 		var validationAction ValidationAction
@@ -216,6 +288,16 @@ func (signatureVerification *SignatureVerification) GetVerificationLevel() (*Ver
 		if validationAction == "" {
 			return nil, fmt.Errorf("verification action %q in custom signature verification is not supported, supported values are %q", value, ValidationActions)
 		}
+		if isGraded {
+			// graded revocation actions refine the umbrella "revocation"
+			// action; "skip" would make the graded action meaningless, so it
+			// is rejected here and must be expressed through "revocation".
+			if validationAction == ActionSkip {
+				return nil, fmt.Errorf("%q verification can not be skipped in custom signature verification, supported values are %q; use %q to skip the revocation check", key, RevocationGradedActions, TypeRevocation)
+			}
+			customVerificationLevel.Enforcement[validationType] = validationAction
+			continue
+		}
 		if validationType == TypeIntegrity {
 			return nil, fmt.Errorf("%q verification can not be overridden in custom signature verification", key)
 		} else if validationType != TypeRevocation && validationAction == ActionSkip {
@@ -224,6 +306,27 @@ func (signatureVerification *SignatureVerification) GetVerificationLevel() (*Ver
 		customVerificationLevel.Enforcement[validationType] = validationAction
 	}
 	return customVerificationLevel, nil
+}
+
+// RevocationAction returns the action that applies to a revocation check
+// which ended with the given outcome.
+//
+// The umbrella "revocation" action is the default for both failure classes.
+// [TypeRevoked] and [TypeRevocationUnavailable] refine it for confirmed
+// revocations and undetermined revocation status respectively, and only take
+// effect when they are configured. A nil level has no configuration, so the
+// zero value [ActionEnforce] is returned to fail closed.
+func (level *VerificationLevel) RevocationAction(outcome RevocationOutcome) ValidationAction {
+	if level == nil {
+		return ActionEnforce
+	}
+	if action, ok := level.Enforcement[ValidationType(outcome)]; ok {
+		return action
+	}
+	if action, ok := level.Enforcement[TypeRevocation]; ok {
+		return action
+	}
+	return ActionEnforce
 }
 
 func getDocument(path string, v any) error {

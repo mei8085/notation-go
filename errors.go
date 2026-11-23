@@ -13,6 +13,8 @@
 
 package notation
 
+import "github.com/notaryproject/notation-go/verifier/trustpolicy"
+
 // ErrorPushSignatureFailed is used when failed to push signature to the
 // target registry.
 //
@@ -87,6 +89,32 @@ func (e SignatureRetrievalFailedError) Error() string {
 		return e.Msg
 	}
 	return "unable to retrieve the digital signature from the registry"
+}
+
+// RevocationStatusError is the error attached to a revocation
+// [ValidationResult] when the revocation check did not conclude that the
+// certificate chain is in good standing. It records the graded classification
+// of the result, the certificate that determined it and the trust policy
+// action applied to it, so callers can distinguish a confirmed revocation from
+// an undetermined revocation status without parsing the message.
+type RevocationStatusError struct {
+	// Outcome is the graded classification of the revocation result.
+	Outcome trustpolicy.RevocationOutcome
+
+	// Subject is the subject of the certificate that determined the outcome.
+	Subject string
+
+	// Action is the trust policy action applied to the outcome.
+	Action trustpolicy.ValidationAction
+
+	// Msg is the human-readable failure reason. It is also what Error
+	// returns, so the message text is unchanged for callers that compare
+	// error strings.
+	Msg string
+}
+
+func (e RevocationStatusError) Error() string {
+	return e.Msg
 }
 
 // ErrorVerificationFailed is used when it is determined that the digital

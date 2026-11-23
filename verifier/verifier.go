@@ -525,8 +525,7 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 	// verify revocation
 	// check if we need to bypass the revocation check, since revocation can be
 	// skipped using a trust policy or a plugin may override the check
-	if outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation] != trustpolicy.ActionSkip &&
-		!slices.Contains(pluginCapabilities, pluginframework.CapabilityRevocationCheckVerifier) {
+	if shouldVerifyRevocation(outcome.VerificationLevel, pluginCapabilities) {
 
 		logger.Debug("Validating revocation")
 		revocationResult := v.verifyRevocation(ctx, outcome)
@@ -563,15 +562,29 @@ func (v *verifier) processSignature(ctx context.Context, sigBlob []byte, envelop
 	return nil
 }
 
+// shouldVerifyRevocation reports whether notation must perform the revocation
+// check itself. The check is bypassed when the umbrella "revocation" action is
+// "skip", or when an installed verification plugin takes over the revocation
+// check. The graded "revoked" and "revocationUnavailable" actions only refine
+// the handling of a performed check, so they never gate it.
+func shouldVerifyRevocation(level *trustpolicy.VerificationLevel, pluginCapabilities []pluginframework.Capability) bool {
+	if level == nil {
+		return true
+	}
+	if level.Enforcement[trustpolicy.TypeRevocation] == trustpolicy.ActionSkip {
+		return false
+	}
+	return !slices.Contains(pluginCapabilities, pluginframework.CapabilityRevocationCheckVerifier)
+}
+
 func (v *verifier) verifyRevocation(ctx context.Context, outcome *notation.VerificationOutcome) *notation.ValidationResult {
 	logger := log.GetLogger(ctx)
+	level := outcome.VerificationLevel
 
 	if v.revocationCodeSigningValidator == nil && v.revocationClient == nil {
-		return &notation.ValidationResult{
-			Type:   trustpolicy.TypeRevocation,
-			Action: outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation],
-			Error:  fmt.Errorf("unable to check revocation status, code signing revocation validator cannot be nil"),
-		}
+		// A validator failure means no status could be established, so the
+		// graded "revocationUnavailable" action (if configured) applies.
+		return revocationUnavailableResult(level, "", fmt.Errorf("unable to check revocation status, code signing revocation validator cannot be nil"))
 	}
 
 	var authenticSigningTime time.Time
@@ -591,29 +604,74 @@ func (v *verifier) verifyRevocation(ctx context.Context, outcome *notation.Verif
 	}
 	if err != nil {
 		logger.Debug("Error while checking revocation status, err: %s", err.Error())
-		return &notation.ValidationResult{
-			Type:   trustpolicy.TypeRevocation,
-			Action: outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation],
-			Error:  fmt.Errorf("unable to check revocation status, err: %s", err.Error()),
-		}
+		// The validator itself failed, so no revocation status was
+		// established. This is an undetermined status, not a revocation.
+		return revocationUnavailableResult(level, "", fmt.Errorf("unable to check revocation status, err: %s", err.Error()))
 	}
 
-	result := &notation.ValidationResult{
-		Type:   trustpolicy.TypeRevocation,
-		Action: outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation],
-	}
 	finalResult, problematicCertSubject := revocationFinalResult(certResults, outcome.EnvelopeContent.SignerInfo.CertificateChain, logger)
 	switch finalResult {
 	case revocationresult.ResultOK:
 		logger.Debug("No verification impacting errors encountered while checking revocation, status is OK")
+		// Graded actions only describe failure classes, so a successful
+		// check reports the umbrella "revocation" action.
+		return &notation.ValidationResult{
+			Type:   trustpolicy.TypeRevocation,
+			Action: umbrellaRevocationAction(level),
+		}
 	case revocationresult.ResultRevoked:
-		result.Error = fmt.Errorf("signing certificate with subject %q is revoked", problematicCertSubject)
+		// Confirmed revocation: apply the graded "revoked" action (falling
+		// back to the umbrella "revocation" action when not configured).
+		logger.Debug("Revocation check concluded that the signing certificate is revoked")
+		action := level.RevocationAction(trustpolicy.RevocationOutcomeRevoked)
+		return &notation.ValidationResult{
+			Type:   trustpolicy.TypeRevocation,
+			Action: action,
+			Error: notation.RevocationStatusError{
+				Outcome: trustpolicy.RevocationOutcomeRevoked,
+				Subject: problematicCertSubject,
+				Action:  action,
+				Msg:     fmt.Sprintf("signing certificate with subject %q is revoked", problematicCertSubject),
+			},
+		}
 	default:
-		// revocationresult.ResultUnknown
-		result.Error = fmt.Errorf("signing certificate with subject %q revocation status is unknown", problematicCertSubject)
+		// revocationresult.ResultUnknown: the status could not be determined,
+		// which is a different failure class than a confirmed revocation.
+		// Apply the graded "revocationUnavailable" action (falling back to
+		// the umbrella "revocation" action when not configured).
+		return revocationUnavailableResult(level, problematicCertSubject, fmt.Errorf("signing certificate with subject %q revocation status is unknown", problematicCertSubject))
 	}
+}
 
-	return result
+// revocationUnavailableResult builds the revocation validation result for an
+// undetermined revocation status, applying the graded
+// "revocationUnavailable" action when configured and falling back to the
+// umbrella "revocation" action otherwise.
+func revocationUnavailableResult(level *trustpolicy.VerificationLevel, problematicCertSubject string, err error) *notation.ValidationResult {
+	action := level.RevocationAction(trustpolicy.RevocationOutcomeUndetermined)
+	return &notation.ValidationResult{
+		Type:   trustpolicy.TypeRevocation,
+		Action: action,
+		Error: notation.RevocationStatusError{
+			Outcome: trustpolicy.RevocationOutcomeUndetermined,
+			Subject: problematicCertSubject,
+			Action:  action,
+			Msg:     err.Error(),
+		},
+	}
+}
+
+// umbrellaRevocationAction returns the umbrella "revocation" action of level,
+// defaulting to [trustpolicy.ActionEnforce] when it is not configured so a
+// missing configuration fails closed.
+func umbrellaRevocationAction(level *trustpolicy.VerificationLevel) trustpolicy.ValidationAction {
+	if level == nil {
+		return trustpolicy.ActionEnforce
+	}
+	if action, ok := level.Enforcement[trustpolicy.TypeRevocation]; ok {
+		return action
+	}
+	return trustpolicy.ActionEnforce
 }
 
 func processPluginResponse(capabilitiesToVerify []pluginframework.Capability, response *pluginframework.VerifySignatureResponse, outcome *notation.VerificationOutcome) error {
@@ -655,17 +713,23 @@ func processPluginResponse(capabilitiesToVerify []pluginframework.Capability, re
 				}
 			}
 		case pluginframework.CapabilityRevocationCheckVerifier:
+			// The plugin only reports success or failure and does not
+			// classify the failure as a confirmed revocation or an
+			// undetermined status, so the graded actions cannot be applied
+			// exactly. A failed plugin check means the revocation status was
+			// not positively confirmed, which is the conservative
+			// classification, so it is graded as an undetermined status.
 			var revocationResult *notation.ValidationResult
 			if !pluginResult.Success {
 				revocationResult = &notation.ValidationResult{
 					Error:  fmt.Errorf("revocation check by verification plugin %q failed with reason %q", verificationPluginName, pluginResult.Reason),
 					Type:   trustpolicy.TypeRevocation,
-					Action: outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation],
+					Action: outcome.VerificationLevel.RevocationAction(trustpolicy.RevocationOutcomeUndetermined),
 				}
 			} else {
 				revocationResult = &notation.ValidationResult{
 					Type:   trustpolicy.TypeRevocation,
-					Action: outcome.VerificationLevel.Enforcement[trustpolicy.TypeRevocation],
+					Action: umbrellaRevocationAction(outcome.VerificationLevel),
 				}
 			}
 			outcome.VerificationResults = append(outcome.VerificationResults, revocationResult)
@@ -820,8 +884,23 @@ func verifyAuthenticTimestamp(ctx context.Context, policyName string, trustStore
 }
 
 // revocationFinalResult returns the final revocation result and problematic
-// certificate subject if the final result is not ResultOK
+// certificate subject if the final result is not ResultOK.
+//
+// certResults is expected to have one entry per certificate in certChain, in
+// the same order. A caller-supplied [revocation.Validator] could violate that
+// contract, so a length mismatch is reported as ResultUnknown (undetermined
+// status) instead of being indexed out of bounds; a check that cannot be
+// interpreted must not be treated as a success.
 func revocationFinalResult(certResults []*revocationresult.CertRevocationResult, certChain []*x509.Certificate, logger log.Logger) (revocationresult.Result, string) {
+	if len(certResults) != len(certChain) {
+		logger.Errorf("Revocation check returned %d certificate results for a chain of %d certificates, treating the revocation status as unknown", len(certResults), len(certChain))
+		var subject string
+		if len(certChain) > 0 {
+			// The leaf certificate is the natural subject to report.
+			subject = certChain[0].Subject.String()
+		}
+		return revocationresult.ResultUnknown, subject
+	}
 	finalResult := revocationresult.ResultUnknown
 	numOKResults := 0
 	var problematicCertSubject string
@@ -830,6 +909,12 @@ func revocationFinalResult(certResults []*revocationresult.CertRevocationResult,
 	for i := len(certResults) - 1; i >= 0; i-- {
 		cert := certChain[i]
 		certResult := certResults[i]
+		if certResult == nil {
+			// A nil entry carries no result for this certificate, so the
+			// status of the chain cannot be determined.
+			logger.Errorf("Revocation check returned no result for certificate #%d in chain with subject %q, treating the revocation status as unknown", (i + 1), cert.Subject)
+			return revocationresult.ResultUnknown, cert.Subject.String()
+		}
 		if certResult.RevocationMethod == revocationresult.RevocationMethodOCSPFallbackCRL {
 			// log the fallback warning
 			logger.Warnf("OCSP check failed with unknown error and fallback to CRL check for certificate #%d in chain with subject %q", (i + 1), cert.Subject)
@@ -977,6 +1062,20 @@ func logVerificationResult(logger log.Logger, result *notation.ValidationResult)
 	if result.Error == nil {
 		return
 	}
+	// For graded revocation results, name the classified outcome so the log
+	// makes clear which rule (confirmed revocation vs undetermined status)
+	// produced the failure.
+	var revocationStatus notation.RevocationStatusError
+	if errors.As(result.Error, &revocationStatus) {
+		switch result.Action {
+		case trustpolicy.ActionLog:
+			logger.Warnf("%v validation (%v) failed with validation action set to \"logged\". Failure reason: %v", result.Type, revocationStatus.Outcome, result.Error)
+			return
+		case trustpolicy.ActionEnforce:
+			logger.Errorf("%v validation (%v) failed. Failure reason: %v", result.Type, revocationStatus.Outcome, result.Error)
+			return
+		}
+	}
 	switch result.Action {
 	case trustpolicy.ActionLog:
 		logger.Warnf("%v validation failed with validation action set to \"logged\". Failure reason: %v", result.Type, result.Error)
@@ -1118,10 +1217,25 @@ func verifyTimestamp(ctx context.Context, policyName string, trustStores []strin
 	case revocationresult.ResultOK:
 		logger.Debug("No verification impacting errors encountered while checking timestamping certificate chain revocation, status is OK")
 	case revocationresult.ResultRevoked:
-		return fmt.Errorf("timestamping certificate with subject %q is revoked", problematicCertSubject)
+		// The timestamping certificate chain revocation check is always
+		// enforced, so a confirmed revocation is enforced as well.
+		return notation.RevocationStatusError{
+			Outcome: trustpolicy.RevocationOutcomeRevoked,
+			Subject: problematicCertSubject,
+			Action:  trustpolicy.ActionEnforce,
+			Msg:     fmt.Sprintf("timestamping certificate with subject %q is revoked", problematicCertSubject),
+		}
 	default:
-		// revocationresult.ResultUnknown
-		return fmt.Errorf("timestamping certificate with subject %q revocation status is unknown", problematicCertSubject)
+		// revocationresult.ResultUnknown: the status of the timestamping
+		// certificate chain could not be determined. This is always enforced
+		// for timestamping certificate chains, independently of the graded
+		// revocation actions of the signing certificate chain.
+		return notation.RevocationStatusError{
+			Outcome: trustpolicy.RevocationOutcomeUndetermined,
+			Subject: problematicCertSubject,
+			Action:  trustpolicy.ActionEnforce,
+			Msg:     fmt.Sprintf("timestamping certificate with subject %q revocation status is unknown", problematicCertSubject),
+		}
 	}
 
 	// success

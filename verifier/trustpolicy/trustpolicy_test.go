@@ -280,6 +280,16 @@ func TestCustomVerificationLevel(t *testing.T) {
 		{SignatureVerification{VerificationLevel: "permissive", Override: map[ValidationType]ValidationAction{"authenticTimestamp": "log"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionLog, ActionLog, ActionLog}},
 		{SignatureVerification{VerificationLevel: "audit", Override: map[ValidationType]ValidationAction{"authenticTimestamp": "log"}}, false, []ValidationAction{ActionEnforce, ActionLog, ActionLog, ActionLog, ActionLog}},
 		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"authenticTimestamp": "log"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionLog, ActionEnforce, ActionEnforce}},
+		// graded revocation actions refine "revocation" and cannot change the
+		// umbrella action used to gate the check.
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revoked": "log"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce}},
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revocationUnavailable": "log"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce}},
+		// graded revocation actions cannot be "skip"; either "log" or
+		// "enforce" is accepted.
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revoked": "skip"}}, true, []ValidationAction{}},
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revocationUnavailable": "skip"}}, true, []ValidationAction{}},
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revoked": "enforce"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce}},
+		{SignatureVerification{VerificationLevel: "strict", Override: map[ValidationType]ValidationAction{"revocationUnavailable": "enforce"}}, false, []ValidationAction{ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce, ActionEnforce}},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
@@ -298,6 +308,143 @@ func TestCustomVerificationLevel(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRevocationAction(t *testing.T) {
+	tests := []struct {
+		name    string
+		level   *VerificationLevel
+		outcome RevocationOutcome
+		want    ValidationAction
+	}{
+		{
+			name:    "nil level fails closed",
+			level:   nil,
+			outcome: RevocationOutcomeRevoked,
+			want:    ActionEnforce,
+		},
+		{
+			name:    "nil level fails closed for undetermined",
+			level:   nil,
+			outcome: RevocationOutcomeUndetermined,
+			want:    ActionEnforce,
+		},
+		{
+			name:    "strict revoked falls back to umbrella",
+			level:   LevelStrict,
+			outcome: RevocationOutcomeRevoked,
+			want:    ActionEnforce,
+		},
+		{
+			name:    "permissive undetermined falls back to umbrella",
+			level:   LevelPermissive,
+			outcome: RevocationOutcomeUndetermined,
+			want:    ActionLog,
+		},
+		{
+			name:    "audit revoked falls back to umbrella",
+			level:   LevelAudit,
+			outcome: RevocationOutcomeRevoked,
+			want:    ActionLog,
+		},
+		{
+			name: "graded revoked overrides umbrella",
+			level: &VerificationLevel{Enforcement: map[ValidationType]ValidationAction{
+				TypeRevocation: ActionLog,
+				TypeRevoked:    ActionEnforce,
+			}},
+			outcome: RevocationOutcomeRevoked,
+			want:    ActionEnforce,
+		},
+		{
+			name: "graded unavailable overrides umbrella",
+			level: &VerificationLevel{Enforcement: map[ValidationType]ValidationAction{
+				TypeRevocation:            ActionEnforce,
+				TypeRevocationUnavailable: ActionLog,
+			}},
+			outcome: RevocationOutcomeUndetermined,
+			want:    ActionLog,
+		},
+		{
+			name: "graded revoked does not apply to undetermined",
+			level: &VerificationLevel{Enforcement: map[ValidationType]ValidationAction{
+				TypeRevocation: ActionLog,
+				TypeRevoked:    ActionEnforce,
+			}},
+			outcome: RevocationOutcomeUndetermined,
+			want:    ActionLog,
+		},
+		{
+			name: "graded unavailable does not apply to revoked",
+			level: &VerificationLevel{Enforcement: map[ValidationType]ValidationAction{
+				TypeRevocation:            ActionEnforce,
+				TypeRevocationUnavailable: ActionLog,
+			}},
+			outcome: RevocationOutcomeRevoked,
+			want:    ActionEnforce,
+		},
+		{
+			name: "missing umbrella defaults to enforce",
+			level: &VerificationLevel{Enforcement: map[ValidationType]ValidationAction{
+				TypeRevoked: ActionLog,
+			}},
+			outcome: RevocationOutcomeUndetermined,
+			want:    ActionEnforce,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.level.RevocationAction(tt.outcome); got != tt.want {
+				t.Fatalf("RevocationAction(%q) = %q, want %q", tt.outcome, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRevocationOutcomeValues pins the override keys to the graded outcome
+// values so the two representations can never drift apart.
+func TestRevocationOutcomeValues(t *testing.T) {
+	if got, want := string(RevocationOutcomeRevoked), string(TypeRevoked); got != want {
+		t.Fatalf("RevocationOutcomeRevoked = %q, want %q (TypeRevoked)", got, want)
+	}
+	if got, want := string(RevocationOutcomeUndetermined), string(TypeRevocationUnavailable); got != want {
+		t.Fatalf("RevocationOutcomeUndetermined = %q, want %q (TypeRevocationUnavailable)", got, want)
+	}
+}
+
+// TestGradedRevocationOverrideRoundTrip checks that a graded override survives
+// JSON serialization and deserialization, so an on-disk trust policy that
+// configures graded revocation handling keeps working.
+func TestGradedRevocationOverrideRoundTrip(t *testing.T) {
+	original := SignatureVerification{
+		VerificationLevel: "strict",
+		Override: map[ValidationType]ValidationAction{
+			TypeRevoked:               ActionLog,
+			TypeRevocationUnavailable: ActionEnforce,
+		},
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var decoded SignatureVerification
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	level, err := decoded.GetVerificationLevel()
+	if err != nil {
+		t.Fatalf("GetVerificationLevel failed: %v", err)
+	}
+	if got := level.RevocationAction(RevocationOutcomeRevoked); got != ActionLog {
+		t.Fatalf("revoked action = %q, want %q", got, ActionLog)
+	}
+	if got := level.RevocationAction(RevocationOutcomeUndetermined); got != ActionEnforce {
+		t.Fatalf("unavailable action = %q, want %q", got, ActionEnforce)
+	}
+	// the umbrella action stays at the base level so the check still runs
+	if got := level.Enforcement[TypeRevocation]; got != ActionEnforce {
+		t.Fatalf("umbrella revocation action = %q, want %q", got, ActionEnforce)
 	}
 }
 

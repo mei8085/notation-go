@@ -477,6 +477,116 @@ func TestVerifyRevocationEnvelope(t *testing.T) {
 			}
 		}
 	})
+
+	// graded revocation handling: the same revoked signature envelope is
+	// accepted or rejected depending on which failure class the trust policy
+	// grades, proving the configuration drives the outcome end-to-end.
+	t.Run("graded revoked logged while umbrella enforced", func(t *testing.T) {
+		policyDoc := dummyOCIPolicyDocument()
+		policyDoc.TrustPolicies[0].SignatureVerification.Override = map[trustpolicy.ValidationType]trustpolicy.ValidationAction{
+			trustpolicy.TypeAuthenticity:          trustpolicy.ActionLog,
+			trustpolicy.TypeRevocation:            trustpolicy.ActionEnforce,
+			trustpolicy.TypeRevoked:               trustpolicy.ActionLog,
+			trustpolicy.TypeRevocationUnavailable: trustpolicy.ActionEnforce,
+		}
+
+		dir.UserConfigDir = "testdata"
+
+		v := verifier{
+			ociTrustPolicyDoc: &policyDoc,
+			trustStore:        truststore.NewX509TrustStore(dir.ConfigFS()),
+			pluginManager:     pluginManager,
+			revocationClient:  revocationClient,
+		}
+		outcome, err := v.Verify(context.Background(), desc, envelopeBlob, opts)
+		if err != nil {
+			t.Fatalf("Unexpected error while verifying: %v", err)
+		}
+		var revocationResult *notation.ValidationResult
+		for _, result := range outcome.VerificationResults {
+			if result.Type == trustpolicy.TypeRevocation {
+				revocationResult = result
+			}
+		}
+		if revocationResult == nil {
+			t.Fatal("expected a revocation validation result")
+		}
+		if revocationResult.Action != trustpolicy.ActionLog {
+			t.Fatalf("revocation action = %q, want %q", revocationResult.Action, trustpolicy.ActionLog)
+		}
+		var statusErr notation.RevocationStatusError
+		if !errors.As(revocationResult.Error, &statusErr) || statusErr.Outcome != trustpolicy.RevocationOutcomeRevoked {
+			t.Fatalf("expected a classified revoked outcome, got %v", revocationResult.Error)
+		}
+	})
+
+	t.Run("graded revoked enforced over permissive umbrella", func(t *testing.T) {
+		policyDoc := dummyOCIPolicyDocument()
+		policyDoc.TrustPolicies[0].SignatureVerification.VerificationLevel = trustpolicy.LevelPermissive.Name
+		policyDoc.TrustPolicies[0].SignatureVerification.Override = map[trustpolicy.ValidationType]trustpolicy.ValidationAction{
+			trustpolicy.TypeAuthenticity: trustpolicy.ActionLog,
+			trustpolicy.TypeRevoked:      trustpolicy.ActionEnforce,
+		}
+		var expectedErr error = fmt.Errorf("signing certificate with subject %q is revoked", revokableChain[0].Cert.Subject.String())
+
+		dir.UserConfigDir = "testdata"
+
+		v := verifier{
+			ociTrustPolicyDoc: &policyDoc,
+			trustStore:        truststore.NewX509TrustStore(dir.ConfigFS()),
+			pluginManager:     pluginManager,
+			revocationClient:  revocationClient,
+		}
+		outcome, err := v.Verify(context.Background(), desc, envelopeBlob, opts)
+		if err == nil || err.Error() != expectedErr.Error() {
+			t.Fatalf("Expected verify to fail with %v, but got %v", expectedErr, err)
+		}
+		verifyResult(outcome, notation.ValidationResult{
+			Type:   trustpolicy.TypeRevocation,
+			Action: trustpolicy.ActionEnforce,
+			Error:  expectedErr,
+		}, expectedErr, t)
+	})
+
+	// Updating the trust policy must take effect on the next operation: the
+	// same revoked signature is rejected first with the umbrella action and
+	// then accepted once the revoked failure class is graded as logged.
+	t.Run("policy update applies to subsequent verification", func(t *testing.T) {
+		policyDoc := dummyOCIPolicyDocument()
+		policyDoc.TrustPolicies[0].SignatureVerification.Override = map[trustpolicy.ValidationType]trustpolicy.ValidationAction{
+			trustpolicy.TypeAuthenticity: trustpolicy.ActionLog,
+			trustpolicy.TypeRevocation:   trustpolicy.ActionEnforce,
+		}
+		dir.UserConfigDir = "testdata"
+		v := verifier{
+			ociTrustPolicyDoc: &policyDoc,
+			trustStore:        truststore.NewX509TrustStore(dir.ConfigFS()),
+			pluginManager:     pluginManager,
+			revocationClient:  revocationClient,
+		}
+
+		if _, err := v.Verify(context.Background(), desc, envelopeBlob, opts); err == nil {
+			t.Fatal("expected the revoked signature to be rejected before the policy update")
+		}
+
+		policyDoc.TrustPolicies[0].SignatureVerification.Override = map[trustpolicy.ValidationType]trustpolicy.ValidationAction{
+			trustpolicy.TypeAuthenticity: trustpolicy.ActionLog,
+			trustpolicy.TypeRevoked:      trustpolicy.ActionLog,
+		}
+		outcome, err := v.Verify(context.Background(), desc, envelopeBlob, opts)
+		if err != nil {
+			t.Fatalf("expected the revoked signature to be accepted after the policy update, got %v", err)
+		}
+		var revocationResult *notation.ValidationResult
+		for _, result := range outcome.VerificationResults {
+			if result.Type == trustpolicy.TypeRevocation {
+				revocationResult = result
+			}
+		}
+		if revocationResult == nil || revocationResult.Action != trustpolicy.ActionLog {
+			t.Fatalf("expected a logged revocation result after the policy update, got %+v", revocationResult)
+		}
+	})
 }
 
 func createMockOutcome(certChain []*x509.Certificate, signingTime time.Time) *notation.VerificationOutcome {
@@ -1255,6 +1365,47 @@ func assertPluginVerification(scheme signature.SigningScheme, t *testing.T) {
 	outcome, err = v.Verify(context.Background(), mock.ImageDescriptor, pluginSigEnv, opts)
 	if err == nil || outcome.Error == nil || outcome.Error.Error() != "verification plugin \"plugin-name\" failed to verify \"SIGNATURE_VERIFIER.TRUSTED_IDENTITY\"" {
 		t.Fatalf("verification should fail when the verification plugin does not return response for a capability. error : %v", outcome.Error)
+	}
+
+	// plugin revocation failure is graded as an undetermined status, so a
+	// graded "revocationUnavailable" action is applied to it
+	policyDocument.TrustPolicies[0].SignatureVerification.Override = map[trustpolicy.ValidationType]trustpolicy.ValidationAction{
+		trustpolicy.TypeRevocation:            trustpolicy.ActionEnforce,
+		trustpolicy.TypeRevocationUnavailable: trustpolicy.ActionLog,
+	}
+	pluginManager = mock.PluginManager{}
+	pluginManager.PluginCapabilities = []proto.Capability{proto.CapabilityRevocationCheckVerifier}
+	pluginManager.PluginRunnerExecuteResponse = &proto.VerifySignatureResponse{
+		VerificationResults: map[proto.Capability]*proto.VerificationResult{
+			proto.CapabilityRevocationCheckVerifier: {
+				Success: false,
+				Reason:  "plugin could not reach the responder",
+			},
+		},
+		ProcessedAttributes: []interface{}{mock.PluginExtendedCriticalAttribute.Key},
+	}
+	v = verifier{
+		ociTrustPolicyDoc: &policyDocument,
+		trustStore:        x509TrustStore,
+		pluginManager:     pluginManager,
+		revocationClient:  revocationClient,
+	}
+	opts = notation.VerifierVerifyOptions{ArtifactReference: mock.SampleArtifactUri, SignatureMediaType: "application/jose+json"}
+	outcome, err = v.Verify(context.Background(), mock.ImageDescriptor, pluginSigEnv, opts)
+	if err != nil || outcome.Error != nil {
+		t.Fatalf("a logged plugin revocation failure should not fail verification. error : %v", outcome.Error)
+	}
+	var pluginRevocationResult *notation.ValidationResult
+	for _, r := range outcome.VerificationResults {
+		if r.Type == trustpolicy.TypeRevocation {
+			pluginRevocationResult = r
+		}
+	}
+	if pluginRevocationResult == nil {
+		t.Fatal("expected a revocation validation result from the plugin")
+	}
+	if pluginRevocationResult.Action != trustpolicy.ActionLog {
+		t.Fatalf("plugin revocation action = %q, want %q", pluginRevocationResult.Action, trustpolicy.ActionLog)
 	}
 }
 
